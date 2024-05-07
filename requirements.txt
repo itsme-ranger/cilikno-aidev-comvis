@@ -1,3 +1,6 @@
 numpy
 pyyaml
 opencv-contrib-python>=4.8.1.78
+matplotlib
+pillow
+shapely

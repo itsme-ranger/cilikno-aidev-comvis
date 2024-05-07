@@ -4,7 +4,8 @@ Candidate: Ramadhan Gerry Akbar
 
 ## How does it work?
 1. Future improvement parts like speed analysis are tricky because camera setup really influence the analytic performance, like too slow shutter speed leads to always blurry shots while too fast leads to crisp shot for first few thousands RPM but introduces confusion of classifying whether the Beyblade is already stopped or still spinning, especially if the shutter speed and video FPS combinations are matched with Beyblade rotational velocity
-2. In main_traditional-cv.py, I have tried several methods to do beyblades detection:
+2. A region will be considered as a detected beyblade if BOTH GroundingDINO AND HoughCircle treat the region as positive case. For tracking, feature matching achieved through the dominant color inside detected circle. Hence, beyblades should have a distinct color from each other. To detect whether a beyblade is already stopped: background subtraction OR check whether center of beyblade is further than radius of arena or not
+3. In main_traditional-cv.py, I have tried several methods to do beyblades detection:
    1. Background subtraction: frames differences, GMG
    2. Circle detection using Houghcircle
    Using all of those methods, I didn’t find any of those methods work reliably on public footages, including due to shadows. Sure, I believe We can tackle with combination of those methods + fine tuning using workaround e.g. digital stabilization for background, limiting the bounding boxes area, bbox’s aspect ratio, IoU, use tracking in case of missing detections, etc. but that will need quite a time

@@ -20,6 +20,7 @@ MIN_SIZE_FOR_MOVEMENT = 100
 # Minimum length of time where no motion is detected it should take
 #(in program cycles) for the program to declare that there is no movement
 MOVEMENT_DETECTED_PERSISTENCE = 100
+MOVE_RANGE_PCNT = 5
 
 SEC_AFTER_POLYGON_CREA = 1.0
 
@@ -32,9 +33,12 @@ from pathlib import Path
 import glob
 import pickle
 import copy
+import faiss
 import yaml
+import math
 from datetime import datetime
 from typing import overload
+from colorthief import ColorThief
 import numpy as np
 import csv
 from shapely.geometry import box
@@ -267,6 +271,7 @@ print(f"== Processing {vid_path.name} init ==")
 vidcap = cv2.VideoCapture(_VID_PATH)
 
 _FPS = vidcap.get(cv2.CAP_PROP_FPS)
+_MOVE_RANGE_PCNT = MOVE_RANGE_PCNT/100*max(vidcap.get(3), vidcap.get(4))
 
 obj = Circle3PointsGenMousePack("arena", orig_height=vidcap.get(4))
 beyblade_obj = Circle3PointsGenMousePack("beyblades", orig_height=vidcap.get(4))
@@ -315,9 +320,8 @@ frames_mask_prior = []
 frames_mask_priorBS = []
 
 bboxes_prev = []
-rpm = {1:[], 2:[]}
-xs = {1:[], 2:[]}
-ys = {1:[], 2:[]}
+xs = np.zeros((0,2))
+ys = np.zeros((0,2))
 
 prev_frame = None
 if enroll_obj.is_enrolled:
@@ -341,16 +345,19 @@ if enroll_obj.is_enrolled:
     
     frames_prior.append(gray)
 
+is_battle_on=True
+winner = None
 kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3))
 fgbg = cv2.bgsegm.createBackgroundSubtractorGMG(initializationFrames=round(_FPS))
 
 prev_boxes = {}
+prev_colors = np.zeros((0,3))
 
 time_start_func = datetime.now()
 while vidcap.isOpened():
     ret, obj.frame = vidcap.read()
 
-    if ret:
+    if ret and is_battle_on:
         obj.frame_ith += 1
         if _RESIZE:
             orig_height = obj.frame.shape[0]
@@ -396,29 +403,124 @@ while vidcap.isOpened():
         boxes = boxes * torch.Tensor([w, h, w, h])
         xyxy = box_convert(boxes=boxes, in_fmt="cxcywh", out_fmt="xyxy").numpy()
 
-        beyblade_circles = None
+        OFFSET_ENCIRCLE = 0.1
+        detected_beyblade_cnt = 0
+        colors = np.zeros((0,3))
+        xs_temp = np.array([])
+        ys_temp = np.array([])
+        bbox_temp = np.zeros((0,4))
+        for box in xyxy:
+            h_ = box[3]-box[1]
+            w_ = box[2]-box[0]
+            top_left = [max(0,box[0]-round(w_*OFFSET_ENCIRCLE)), max(0, box[1]-round(h_*OFFSET_ENCIRCLE))]
+            bot_right = [min(width,box[2]+round(w_*OFFSET_ENCIRCLE)), min(height, box[3]+round(h_*OFFSET_ENCIRCLE))]
+            cropped = frame[top_left[0]:bot_right[0], top_left[1]:bot_right[1]]
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        # print(f"gray={gray.shape}")
+            beyblade_circles = None
 
-        gray = cv2.equalizeHist(gray)
-        # Blur it to remove camera noise (reducing false positives)
-        gray = cv2.GaussianBlur(gray, (9, 9), 0)
-        # print(f"gblur={gray.shape}")
+            gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
+            # print(f"gray={gray.shape}")
 
-        if beyblade_obj.detected_radius is not None:
-            bb_rad = round(beyblade_obj.detected_radius)
-            gap = round(_BEYBLADE_RAD_TOLERANCE/100*bb_rad)
-            minDis = bb_rad*2 - gap
-            minRadius = round(bb_rad - gap/2)
-            maxRadius = round(bb_rad + gap/2)
-            beyblade_circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, 1, minDis, param1=14, param2=25, minRadius=minRadius, maxRadius=maxRadius)
+            gray = cv2.equalizeHist(gray)
+            # Blur it to remove camera noise (reducing false positives)
+            gray = cv2.GaussianBlur(gray, (9, 9), 0)
+            # print(f"gblur={gray.shape}")
+
+            if beyblade_obj.detected_radius is not None:
+                bb_rad = round(beyblade_obj.detected_radius)
+                gap = round(_BEYBLADE_RAD_TOLERANCE/100*bb_rad)
+                minDis = bb_rad*2 - gap
+                minRadius = round(bb_rad - gap/2)
+                maxRadius = round(bb_rad + gap/2)
+                beyblade_circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, 1, minDis, param1=14, param2=25, minRadius=minRadius, maxRadius=maxRadius)
         
-        if beyblade_circles is not None:
-            beyblade_circles = np.round(beyblade_circles[0, :]).astype("int")
-            for (x, y, r) in beyblade_circles:
-                cv2.circle(obj.frame, (x, y), r, (0, 150, 150), 2)
-                cv2.rectangle(obj.frame, (x - 5, y - 5), (x + 5, y + 5), (0, 128, 255), -1)
+            # this bounding box will counts as beyblade
+            if beyblade_circles is not None:
+                beyblade_circles = np.round(beyblade_circles[0, :]).astype("int")
+                for (x, y, r) in beyblade_circles:
+                    # filter by ratio of circle area per rectangle area. If too small, pass
+                    if (math.pi*r*r)/w_*h_ < 0.6:
+                        continue
+                    cv2.circle(obj.frame, (x, y), r, (0, 150, 150), 2)
+                    cv2.rectangle(obj.frame, (x - 5, y - 5), (x + 5, y + 5), (0, 128, 255), -1)
+
+                    col_thief = ColorThief(frame)
+                    col = col_thief.get_color(quality=15)
+                    colors = np.append(colors, col, axis=0)
+                    xs_temp = np.append(xs_temp, x)
+                    ys_temp = np.append(ys_temp, y)
+                    bbox_temp = np.append(bbox_temp, box, axis=0)
+        
+        # tracking
+        index = faiss.IndexFlatL2(3)   # build the index
+        index.add(prev_colors)        
+        if obj.frame_ith > 1:
+            _, I = index.search(colors, 1)
+        else:
+            I = range(len(colors))
+            # todo: pick the best color by sorting the distance, if colors != 2
+        xs = np.append(xs, np.zeros(2), axis=0)
+        ys = np.append(ys, np.zeros(2), axis=0)
+        bboxes = np.zeros((2,4))
+        added_idx = set()
+        for i in range(len(colors)):
+            if len(added_idx) >= 2:
+                break
+            if I[i] in added_idx:
+                continue
+            prev_colors[I[i]] = colors[i]
+            added_idx.add(I[i])
+            xs[-1][I[i]] = xs_temp[i]
+            ys[-1][I[i]] = ys_temp[i]
+            bboxes[I[i]] = bboxes[i]
+        
+        for i in range(2):
+            if i not in added_idx:
+                xs[-1][i] = np.nan
+                ys[-1][i] = np.nan
+                box = np.zeros((4))
+                box.fil(np.nan)
+                bboxes[i] = box
+        # Check whether the battle has finished or not
+        for i,box in enumerate(bboxes):
+            if box[0] == np.nan:
+                continue
+            if math.dist([xs[-1,i], ys[-1,i]], obj.get_center() > obj.get_radius()):
+                winner = (i+1)%2
+                is_battle_on = False
+                break
+            h_ = box[3]-box[1]
+            w_ = box[2]-box[0]
+            top_left = [max(0,box[0]-round(w_*OFFSET_ENCIRCLE)), max(0, box[1]-round(h_*OFFSET_ENCIRCLE))]
+            bot_right = [min(width,box[2]+round(w_*OFFSET_ENCIRCLE)), min(height, box[3]+round(h_*OFFSET_ENCIRCLE))]
+            cropped = fgmask[top_left[0]:bot_right[0], top_left[1]:bot_right[1]]
+
+            thresh = cv2.threshold(cropped, 40, 255, cv2.THRESH_BINARY)[1]
+            cnts, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            significant_move = 0
+            for c in cnts:
+                # Save the coordinates of all found contours
+                (x, y, w, h) = cv2.boundingRect(c)
+                
+                # If the contour is too small, ignore it, otherwise, there's transient
+                # movement
+                if cv2.contourArea(c) >= MIN_SIZE_FOR_MOVEMENT:
+                    significant_move += 1
+            
+            if significant_move == 0:
+                xs_temp = xs[round(-_FPS):,i]
+                ys_temp = ys[round(-_FPS):,i]
+                max_x = max(xs_temp)y
+                min_x = min(xs_temp)
+                max_y = max(ys_temp)
+                min_y = min(ys_temp)
+
+                if (max_x-min_x<=_MOVE_RANGE_PCNT) and (max_y-min_y<=_MOVE_RANGE_PCNT):
+                    winner = (i+1)%2
+                    is_battle_on = False
+                    break
+                    
         
         # If the first frame is nothing, initialise it
         if prev_frame is None:
@@ -538,11 +640,6 @@ while vidcap.isOpened():
                     if box_p.contains(center):
                         is_still_in_battle[k] = True
         
-        if is_total_in_battle:
-            for k,v in is_still_in_battle.items():
-                if not v:
-                    winner = k
-        
         # Convert the frame_delta to color for splicing
         frame_delta = cv2.cvtColor(frame_delta, cv2.COLOR_GRAY2BGR)
         
@@ -592,6 +689,8 @@ while vidcap.isOpened():
     else:
         break
 
+rpm = np.zeros((xs.shape[0], 2))
+rpm.fill(np.nan)
 vidcap.release()
 # if RECORD_IT:
     # vid_writer_out.release()
@@ -620,4 +719,4 @@ with open(_CSV_TRAJECTORY_TARGET_PATH, mode='a+') as f:
     if not is_csv_trajectory_file_exists:
         csv_writer.writerow(["battle_id","time_elapsed", "1_x", "1_y", "1_w", "2_x", "2_y", "2_w"])
     for i in range(len(rpm[2])):
-        csv_writer.writerow([battle_id, i/_FPS, xs[1][i], ys[1][i], rpm[1][i] xs[2][i], ys[2][i], rpm[2][i]])
+        csv_writer.writerow([battle_id, i/_FPS, xs[0][i], ys[0][i], rpm[0][i] xs[1][i], ys[1][i], rpm[1][i]])
